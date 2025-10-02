@@ -3,6 +3,7 @@ Data exploration and processing module for retail analytics pipeline.
 """
 import pandas as pd
 import numpy as np
+from sklearn.cluster import KMeans
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 import logging
@@ -46,6 +47,36 @@ class DataProcessor:
         except Exception as e:
             logger.error(f"Error loading data: {e}")
             raise
+
+    def load_data_from_directory(self, directory_path: str) -> pd.DataFrame:
+        """
+        Load and concatenate multiple CSVs from a directory into a single DataFrame.
+
+        Args:
+            directory_path: Path to directory containing daily sales CSV files
+
+        Returns:
+            pandas.DataFrame: Loaded concatenated sales data
+        """
+        try:
+            logger.info(f"Loading all CSV files from directory: {directory_path}")
+            csv_files = pd.Series(list(pd.io.common.os.listdir(directory_path)))
+            csv_files = csv_files[csv_files.str.lower().str.endswith('.csv')]
+            if len(csv_files) == 0:
+                raise FileNotFoundError("No CSV files found in directory")
+
+            frames = []
+            for f in csv_files:
+                full_path = pd.io.common.os.path.join(directory_path, str(f))
+                logger.info(f"Reading {full_path}")
+                frames.append(pd.read_csv(full_path))
+
+            self.df = pd.concat(frames, ignore_index=True)
+            logger.info(f"Concatenated shape: {self.df.shape}")
+            return self.df
+        except Exception as e:
+            logger.error(f"Error loading directory data: {e}")
+            raise
     
     def clean_data(self) -> pd.DataFrame:
         """
@@ -65,7 +96,7 @@ class DataProcessor:
         # Convert invoice_date to datetime
         df_clean['invoice_date'] = pd.to_datetime(df_clean['invoice_date'], format='%d/%m/%Y')
         
-        # Calculate total amount per transaction
+        # Calculate total amount per transaction (gross before discounts)
         df_clean['total_amount'] = df_clean['quantity'] * df_clean['price']
         
         # Add derived features
@@ -95,6 +126,88 @@ class DataProcessor:
         self.processed_df = df_clean
         
         return df_clean
+
+    def calculate_profitability(
+        self,
+        discount_rate_by_category: Optional[Dict[str, float]] = None,
+        cost_rate_by_category: Optional[Dict[str, float]] = None,
+        per_row_discount_rate_column: Optional[str] = None,
+        per_row_unit_cost_column: Optional[str] = None,
+    ) -> Dict:
+        """
+        Calculate profitability after discounts and estimated costs.
+
+        Args:
+            discount_rate_by_category: Optional mapping of category to discount rate (0-1)
+            cost_rate_by_category: Optional mapping of category to cost rate as a fraction of price (0-1)
+            per_row_discount_rate_column: Optional column name containing per-row discount rate (0-1)
+            per_row_unit_cost_column: Optional column name containing per-row unit cost (absolute currency)
+
+        Returns:
+            Dict: profitability KPIs and breakdowns
+        """
+        if self.processed_df is None:
+            raise ValueError("Data not processed. Call clean_data() first.")
+
+        df = self.processed_df.copy()
+
+        # Determine discount rate per row
+        if per_row_discount_rate_column and per_row_discount_rate_column in df.columns:
+            df['discount_rate'] = df[per_row_discount_rate_column].clip(lower=0, upper=1).fillna(0.0)
+        else:
+            discount_rate_by_category = discount_rate_by_category or {}
+            df['discount_rate'] = df['category'].map(discount_rate_by_category).fillna(0.0)
+
+        # Determine unit cost per row
+        if per_row_unit_cost_column and per_row_unit_cost_column in df.columns:
+            df['unit_cost'] = df[per_row_unit_cost_column].fillna(0.0)
+        else:
+            cost_rate_by_category = cost_rate_by_category or {}
+            # Default cost rate if not provided
+            default_cost_rate = 0.6
+            df['cost_rate'] = df['category'].map(cost_rate_by_category).fillna(default_cost_rate)
+            df['unit_cost'] = (df['price'] * df['cost_rate']).round(2)
+
+        # Revenue after discounts
+        df['net_price'] = (df['price'] * (1 - df['discount_rate'])).round(2)
+        df['net_revenue'] = (df['net_price'] * df['quantity']).round(2)
+
+        # Cost of goods sold
+        df['cogs'] = (df['unit_cost'] * df['quantity']).round(2)
+
+        # Profit and margin
+        df['profit'] = (df['net_revenue'] - df['cogs']).round(2)
+        df['margin_pct'] = np.where(df['net_revenue'] > 0, (df['profit'] / df['net_revenue']).round(4), 0.0)
+
+        # Build a JSON-serializable by_month with string keys like "YYYY-MM"
+        monthly = (
+            df.groupby(['year', 'month'])[['net_revenue', 'cogs', 'profit']]
+            .sum()
+            .round(2)
+            .reset_index()
+        )
+        by_month_serializable = {}
+        for _, row in monthly.iterrows():
+            key = f"{int(row['year'])}-{int(row['month']):02d}"
+            by_month_serializable[key] = {
+                'net_revenue': float(row['net_revenue']),
+                'cogs': float(row['cogs']),
+                'profit': float(row['profit']),
+            }
+
+        profitability_summary = {
+            'total_gross_revenue': float(df['total_amount'].sum().round(2)),
+            'total_net_revenue': float(df['net_revenue'].sum().round(2)),
+            'total_cogs': float(df['cogs'].sum().round(2)),
+            'total_profit': float(df['profit'].sum().round(2)),
+            'avg_margin_pct': float(df['margin_pct'].replace([np.inf, -np.inf], np.nan).fillna(0).mean().round(4)),
+            'by_category': df.groupby('category')[['net_revenue', 'cogs', 'profit']].sum().round(2).astype(float).to_dict(),
+            'by_mall': df.groupby('shopping_mall')[['net_revenue', 'cogs', 'profit']].sum().round(2).astype(float).to_dict(),
+            'by_payment_method': df.groupby('payment_method')[['net_revenue', 'cogs', 'profit']].sum().round(2).astype(float).to_dict(),
+            'by_month': by_month_serializable,
+        }
+
+        return profitability_summary
     
     def get_data_summary(self) -> Dict:
         """
@@ -246,6 +359,128 @@ class DataProcessor:
         logger.info(f"Segment distribution:\n{customer_metrics['customer_segment'].value_counts()}")
         
         return customer_metrics
+
+    def rfm_loyalty_analysis(self) -> Dict:
+        """
+        Perform RFM-based loyalty analysis and return distributions.
+
+        Returns:
+            Dict: distributions and top segments
+        """
+        metrics = self.calculate_customer_metrics()
+        segmented = self.segment_customers(metrics)
+
+        rfm_bins = {
+            'recency_score': segmented['recency_score'].value_counts().sort_index().to_dict(),
+            'frequency_score': segmented['frequency_score'].value_counts().sort_index().to_dict(),
+            'monetary_score': segmented['monetary_score'].value_counts().sort_index().to_dict(),
+        }
+        segments = segmented['customer_segment'].value_counts().to_dict()
+
+        # Top customers sample
+        top_customers = (
+            segmented.sort_values(['rfm_score', 'total_spent', 'transaction_count'], ascending=[False, False, False])
+            .head(20)
+            .reset_index()
+            .to_dict(orient='records')
+        )
+
+        return {
+            'rfm_distribution': rfm_bins,
+            'segment_counts': segments,
+            'top_customers_sample': top_customers,
+        }
+
+    def train_kmeans_segmentation(self, n_clusters: int = 5, random_state: int = 42) -> Dict:
+        """
+        Train a simple KMeans model on customer metrics and return labels and summary.
+
+        Args:
+            n_clusters: number of clusters
+            random_state: rng seed
+
+        Returns:
+            Dict: cluster counts and sample assignments
+        """
+        metrics = self.calculate_customer_metrics()
+        features = metrics[[
+            'total_spent',
+            'avg_transaction_value',
+            'transaction_count',
+            'days_since_last_purchase',
+            'categories_purchased',
+            'malls_visited',
+        ]].fillna(0.0)
+
+        # Basic scaling by log/clip to reduce skew without external deps
+        X = features.copy()
+        X['total_spent'] = np.log1p(X['total_spent'])
+        X['avg_transaction_value'] = np.log1p(X['avg_transaction_value'])
+        X['transaction_count'] = np.log1p(X['transaction_count'])
+        X['days_since_last_purchase'] = np.log1p(X['days_since_last_purchase'].clip(lower=0))
+
+        model = KMeans(n_clusters=n_clusters, n_init=10, random_state=random_state)
+        labels = model.fit_predict(X.values)
+
+        metrics = metrics.copy()
+        metrics['kmeans_cluster'] = labels
+
+        counts = metrics['kmeans_cluster'].value_counts().sort_index().to_dict()
+        sample = metrics.reset_index().head(20)[['customer_id', 'kmeans_cluster']].to_dict(orient='records')
+
+        return {
+            'n_clusters': n_clusters,
+            'cluster_counts': {str(int(k)): int(v) for k, v in counts.items()},
+            'inertia': float(model.inertia_),
+            'sample_assignments': sample,
+        }
+
+    def forecast_monthly_sales_naive(self, periods: int = 3) -> Dict:
+        """
+        Naive monthly sales forecast using last observed value.
+
+        Args:
+            periods: number of future months to forecast
+
+        Returns:
+            Dict: history and forecast series
+        """
+        if self.processed_df is None:
+            raise ValueError("Data not processed. Call clean_data() first.")
+
+        df = self.processed_df
+        hist = (
+            df.groupby(['year', 'month'])['total_amount']
+            .sum()
+            .reset_index()
+            .sort_values(['year', 'month'])
+        )
+        hist['key'] = hist.apply(lambda r: f"{int(r['year'])}-{int(r['month']):02d}", axis=1)
+
+        history_series = {str(k): float(v) for k, v in zip(hist['key'], hist['total_amount'])}
+
+        if len(hist) == 0:
+            return {'history': {}, 'forecast': {}}
+
+        last_year = int(hist.iloc[-1]['year'])
+        last_month = int(hist.iloc[-1]['month'])
+        last_value = float(hist.iloc[-1]['total_amount'])
+
+        # generate future months
+        forecast = {}
+        year, month = last_year, last_month
+        for i in range(periods):
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+            key = f"{year}-{month:02d}"
+            forecast[key] = last_value
+
+        return {
+            'history': history_series,
+            'forecast': forecast,
+        }
     
     def analyze_seasonal_trends(self) -> Dict:
         """
@@ -261,31 +496,75 @@ class DataProcessor:
         
         df = self.processed_df
         
-        # Monthly trends
-        monthly_sales = df.groupby(['year', 'month']).agg({
-            'total_amount': ['sum', 'count'],
-            'customer_id': 'nunique'
-        }).round(2)
-        
+        # Monthly trends (JSON-safe keys and values)
+        monthly_df = (
+            df.groupby(['year', 'month']).agg(
+                total_revenue=('total_amount', 'sum'),
+                transaction_count=('total_amount', 'count'),
+                unique_customers=('customer_id', 'nunique'),
+            ).round(2).reset_index()
+        )
+        monthly_trends: Dict[str, Dict[str, float]] = {}
+        for _, row in monthly_df.iterrows():
+            key = f"{int(row['year'])}-{int(row['month']):02d}"
+            monthly_trends[key] = {
+                'total_revenue': float(row['total_revenue']),
+                'transaction_count': int(row['transaction_count']),
+                'unique_customers': int(row['unique_customers']),
+            }
+
         # Quarterly trends
-        quarterly_sales = df.groupby(['year', 'quarter']).agg({
-            'total_amount': ['sum', 'count'],
-            'customer_id': 'nunique'
-        }).round(2)
-        
+        quarterly_df = (
+            df.groupby(['year', 'quarter']).agg(
+                total_revenue=('total_amount', 'sum'),
+                transaction_count=('total_amount', 'count'),
+                unique_customers=('customer_id', 'nunique'),
+            ).round(2).reset_index()
+        )
+        quarterly_trends: Dict[str, Dict[str, float]] = {}
+        for _, row in quarterly_df.iterrows():
+            key = f"{int(row['year'])}-Q{int(row['quarter'])}"
+            quarterly_trends[key] = {
+                'total_revenue': float(row['total_revenue']),
+                'transaction_count': int(row['transaction_count']),
+                'unique_customers': int(row['unique_customers']),
+            }
+
         # Day of week trends
-        dow_sales = df.groupby('day_of_week').agg({
-            'total_amount': ['sum', 'mean', 'count']
-        }).round(2)
-        
-        # Category seasonal analysis
-        category_monthly = df.groupby(['category', 'month'])['total_amount'].sum().unstack(fill_value=0)
-        
+        dow_df = (
+            df.groupby('day_of_week').agg(
+                total_revenue=('total_amount', 'sum'),
+                avg_revenue=('total_amount', 'mean'),
+                transaction_count=('total_amount', 'count'),
+            ).round(2)
+        )
+        dow_trends: Dict[str, Dict[str, float]] = {}
+        for dow, row in dow_df.iterrows():
+            dow_trends[str(dow)] = {
+                'total_revenue': float(row['total_revenue']),
+                'avg_revenue': float(row['avg_revenue']),
+                'transaction_count': int(row['transaction_count']),
+            }
+
+        # Category seasonal analysis (category -> month -> revenue)
+        cat_month = (
+            df.groupby(['category', 'month'])['total_amount']
+            .sum()
+            .unstack(fill_value=0)
+            .round(2)
+        )
+        category_seasonality: Dict[str, Dict[str, float]] = {}
+        for category, row in cat_month.iterrows():
+            month_map: Dict[str, float] = {}
+            for m, val in row.items():
+                month_map[f"{int(m):02d}"] = float(val)
+            category_seasonality[str(category)] = month_map
+
         seasonal_analysis = {
-            'monthly_trends': monthly_sales.to_dict(),
-            'quarterly_trends': quarterly_sales.to_dict(),
-            'day_of_week_trends': dow_sales.to_dict(),
-            'category_seasonality': category_monthly.to_dict()
+            'monthly_trends': monthly_trends,
+            'quarterly_trends': quarterly_trends,
+            'day_of_week_trends': dow_trends,
+            'category_seasonality': category_seasonality,
         }
         
         logger.info("Seasonal analysis completed")
@@ -306,27 +585,53 @@ class DataProcessor:
         
         df = self.processed_df
         
-        # Payment method analysis
-        payment_analysis = df.groupby('payment_method').agg({
-            'total_amount': ['sum', 'mean', 'count'],
-            'customer_id': 'nunique',
-            'quantity': 'mean'
-        }).round(2)
-        
-        # Payment method by category
-        payment_category = df.groupby(['payment_method', 'category'])['total_amount'].sum().unstack(fill_value=0)
-        
-        # Payment method by mall
-        payment_mall = df.groupby(['payment_method', 'shopping_mall'])['total_amount'].sum().unstack(fill_value=0)
-        
-        # Payment method by age group
-        payment_age = df.groupby(['payment_method', 'age_group'])['total_amount'].sum().unstack(fill_value=0)
-        
+        # Payment method analysis with named aggregations (avoids MultiIndex)
+        payment_summary_df = (
+            df.groupby('payment_method').agg(
+                total_revenue=('total_amount', 'sum'),
+                avg_transaction_value=('total_amount', 'mean'),
+                transaction_count=('total_amount', 'count'),
+                unique_customers=('customer_id', 'nunique'),
+                avg_quantity=('quantity', 'mean'),
+            ).round(2)
+        )
+
+        # Convert to serializable dict
+        payment_summary: Dict[str, Dict[str, float]] = {}
+        for method, row in payment_summary_df.iterrows():
+            payment_summary[str(method)] = {
+                'total_revenue': float(row['total_revenue']),
+                'avg_transaction_value': float(row['avg_transaction_value']),
+                'transaction_count': int(row['transaction_count']),
+                'unique_customers': int(row['unique_customers']),
+                'avg_quantity': float(row['avg_quantity']),
+            }
+
+        # Payment method by category/mall/age group with Python floats
+        def table_to_serializable(table_index_cols: List[str]) -> Dict[str, Dict[str, float]]:
+            pivot = (
+                df.groupby(table_index_cols)['total_amount']
+                .sum()
+                .unstack(fill_value=0)
+                .round(2)
+            )
+            out: Dict[str, Dict[str, float]] = {}
+            for idx, row in pivot.iterrows():
+                row_dict: Dict[str, float] = {}
+                for col, val in row.items():
+                    row_dict[str(col)] = float(val)
+                out[str(idx)] = row_dict
+            return out
+
+        payment_by_category = table_to_serializable(['payment_method', 'category'])
+        payment_by_mall = table_to_serializable(['payment_method', 'shopping_mall'])
+        payment_by_age = table_to_serializable(['payment_method', 'age_group'])
+
         analysis_results = {
-            'payment_summary': payment_analysis.to_dict(),
-            'payment_by_category': payment_category.to_dict(),
-            'payment_by_mall': payment_mall.to_dict(),
-            'payment_by_age': payment_age.to_dict()
+            'payment_summary': payment_summary,
+            'payment_by_category': payment_by_category,
+            'payment_by_mall': payment_by_mall,
+            'payment_by_age': payment_by_age,
         }
         
         logger.info("Payment method analysis completed")
@@ -337,7 +642,7 @@ class DataProcessor:
 def main():
     """Main function to demonstrate data processing."""
     # Initialize processor
-    processor = DataProcessor('..\..\customer_shopping_data.csv')
+    processor = DataProcessor('..\customer_shopping_data.csv')
     
     # Load and clean data
     df = processor.load_data()
