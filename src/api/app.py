@@ -104,6 +104,22 @@ def create_app(data_path: Optional[str] = None) -> FastAPI:
     def forecast_monthly(periods: int = 3):
         return app.state.processor.forecast_monthly_sales_naive(periods=periods)
 
+    @app.get("/customers/top")
+    def customers_top(top_percent: float = Query(0.10, ge=0.01, le=1.0), min_transactions: int = 1):
+        return app.state.processor.top_customers(top_percent=top_percent, min_transactions=min_transactions)
+
+    @app.get("/customers/repeat-vs-onetime")
+    def repeat_vs_onetime():
+        return app.state.processor.repeat_vs_onetime()
+
+    @app.get("/kpis/categories")
+    def categories_kpis():
+        return app.state.processor.categories_kpis()
+
+    @app.get("/simulation/campaign")
+    def simulation_campaign(segment: str = 'High Value', discount: float = Query(0.10, ge=0.0, le=1.0)):
+        return app.state.processor.simulate_campaign(segment=segment, discount=discount)
+
     return app
 
 
