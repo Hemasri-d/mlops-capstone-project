@@ -1,0 +1,58 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dylib
+
+# Environments
+.venv/
+venv/
+env/
+.conda/
+
+# Env files / secrets
+.env
+.env.*
+*.env
+
+# Builds & packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing & coverage
+.pytest_cache/
+.coverage*
+htmlcov/
+.tox/
+
+# Type checking / tooling caches
+.mypy_cache/
+.pytype/
+.cache/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs
+logs/
+*.log
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data/ML artifacts (adjust as needed)
+mlruns/
+model_artifacts/
+
+# Node (if applicable)
+node_modules/
